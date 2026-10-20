@@ -1,0 +1,18 @@
+# Compiled binaries
+fastcrop
+*.o
+*.so
+*.a
+
+# Temporary files
+*.tmp*
+*.swp
+*~
+.DS_Store
+
+# Build directories and test folders
+build/
+test_output/
+test/
+__pycache__/
+*.pyc
