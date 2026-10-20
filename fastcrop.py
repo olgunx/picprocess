@@ -123,15 +123,19 @@ def process_image(in_path, out_path, crop_spec, quality, out_format, skip_existi
         return ('error', 0, 0, str(exc))
 
 
-def find_images(input_path, recursive=False):
+def find_images(input_path, output_path=None, recursive=True):
     """Yield image file paths lazily to keep memory minimal."""
-    path = Path(input_path)
+    path = Path(input_path).resolve()
+    out = Path(output_path).resolve() if output_path else None
     if path.is_file():
         yield path
         return
 
     if recursive:
-        for root, _, files in os.walk(path):
+        for root, dirs, files in os.walk(path):
+            # Avoid scanning output directory if placed inside input
+            if out:
+                dirs[:] = [d for d in dirs if (Path(root) / d).resolve() != out]
             for f in files:
                 ext = os.path.splitext(f)[1].lower()
                 if ext in SUPPORTED_EXTENSIONS:
@@ -153,7 +157,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Crop 640x480 box at (100, 50) for thousands of photos:
+  # Crop 640x480 box across all folders and subfolders:
   %(prog)s -i /media/photos -o /media/crops -c 100,50,640,480
 
   # Crop center 50%% as WebP (super low file size) using 4 threads:
@@ -172,7 +176,9 @@ Examples:
     parser.add_argument('-t', '--threads', type=int, default=default_threads, help=f"Worker threads (default: {default_threads})")
     parser.add_argument('-f', '--format', choices=['jpg', 'jpeg', 'webp', 'png', 'same'], default=None,
                         help="Output image format (webp yields smallest file sizes)")
-    parser.add_argument('-r', '--recursive', action='store_true', help="Recursively process subdirectories")
+    parser.add_argument('-r', '--recursive', action='store_true', default=True, help="Process subdirectories (default: True)")
+    parser.add_argument('-n', '--no-recursive', '--flat', action='store_false', dest='recursive',
+                        help="Disable subdirectories (top-level only)")
     parser.add_argument('-s', '--skip-existing', action='store_true', help="Skip files already present in output (resume)")
     parser.add_argument('-v', '--verbose', action='store_true', help="Print verbose error messages")
 
@@ -220,7 +226,7 @@ Examples:
 
     # Build work generator
     def task_generator():
-        for in_file in find_images(in_root, recursive=args.recursive):
+        for in_file in find_images(in_root, output_path=out_root, recursive=args.recursive):
             if in_root.is_file():
                 rel = in_file.name
             else:

@@ -100,7 +100,7 @@ static Config g_config = {
     .use_pct = false,
     .quality = 75,
     .num_threads = 4,
-    .recursive = false,
+    .recursive = true,
     .skip_existing = false,
     .verbose = false
 };
@@ -449,6 +449,17 @@ static void scan_directory(const char *in_dir, const char *out_dir, const char *
 
         if (S_ISDIR(st.st_mode)) {
             if (g_config.recursive) {
+                char *real_sub = realpath(full_in, NULL);
+                char *real_out = realpath(out_dir, NULL);
+                bool is_out = false;
+                if (real_sub && real_out && strcmp(real_sub, real_out) == 0) {
+                    is_out = true;
+                }
+                free(real_sub);
+                free(real_out);
+                if (is_out) {
+                    continue;
+                }
                 scan_directory(in_dir, out_dir, item_subpath);
             }
         } else if (S_ISREG(st.st_mode) && is_jpeg_extension(entry->d_name)) {
@@ -475,12 +486,13 @@ static void print_help(const char *progname) {
     printf("  -o, --output <dir>            Output directory\n");
     printf("  -q, --quality <1-100>         JPEG output quality (default: 75, compact size)\n");
     printf("  -t, --threads <N>             Worker threads (default: CPU cores, max 4 on Pi Zero 2)\n");
-    printf("  -r, --recursive               Recursively process subdirectories\n");
+    printf("  -r, --recursive               Process subdirectories (default: ENABLED)\n");
+    printf("  -n, --no-recursive, --flat    Disable subdirectories processing (top-level only)\n");
     printf("  -s, --skip-existing           Skip files already present in output (resume)\n");
     printf("  -v, --verbose                 Enable detailed warning messages\n");
     printf("  -h, --help                    Show this help message\n\n");
     printf("Examples:\n");
-    printf("  # Crop a 640x480 box starting at (100, 50) for thousands of images:\n");
+    printf("  # Crop a 640x480 box across all folders and subfolders:\n");
     printf("  %s -i /media/photos -o /media/crops -c 100,50,640,480\n\n", progname);
     printf("  # Crop the center 50%% with quality 75 and 4 threads:\n");
     printf("  %s -i ./photos -o ./crops -p 25,25,50,50 -q 75 -t 4 -s\n\n", progname);
@@ -501,6 +513,8 @@ int main(int argc, char **argv) {
         {"quality",       required_argument, 0, 'q'},
         {"threads",       required_argument, 0, 't'},
         {"recursive",     no_argument,       0, 'r'},
+        {"no-recursive",  no_argument,       0, 'n'},
+        {"flat",          no_argument,       0, 'n'},
         {"skip-existing", no_argument,       0, 's'},
         {"verbose",       no_argument,       0, 'v'},
         {"help",          no_argument,       0, 'h'},
@@ -510,7 +524,7 @@ int main(int argc, char **argv) {
     int opt;
     bool has_crop = false;
 
-    while ((opt = getopt_long(argc, argv, "i:o:c:p:b:q:t:rsvh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:o:c:p:b:q:t:rnsvh", long_options, NULL)) != -1) {
         switch (opt) {
             case 'i':
                 snprintf(g_config.in_dir, sizeof(g_config.in_dir), "%s", optarg);
@@ -567,6 +581,9 @@ int main(int argc, char **argv) {
                 break;
             case 'r':
                 g_config.recursive = true;
+                break;
+            case 'n':
+                g_config.recursive = false;
                 break;
             case 's':
                 g_config.skip_existing = true;

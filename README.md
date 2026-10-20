@@ -98,7 +98,8 @@ Both `fastcrop` (C) and `fastcrop.py` (Python) share consistent CLI parameters:
 | `--quality <1-100>` | `-q` | Compression quality (75 is sweet spot) | `75` |
 | `--threads <N>` | `-t` | Worker threads (auto-detected, capped at 4) | `4` |
 | `--skip-existing` | `-s` | Resume mode: skip already cropped files | `false` |
-| `--recursive` | `-r` | Scan subdirectories recursively | `false` |
+| `--recursive` | `-r` | Scan subdirectories recursively | **`true` (Enabled by default)** |
+| `--no-recursive` | `-n`, `--flat` | Disable subdirectories (top-level only) | `false` |
 | `--format <fmt>` | `-f` | Output format: `jpg`, `webp`, `png` *(Python)* | `source` |
 | `--verbose` | `-v` | Show detailed warnings for corrupted files | `false` |
 | `--help` | `-h` | Display help screen | |
