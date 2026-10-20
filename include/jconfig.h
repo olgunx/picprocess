@@ -1,7 +1,12 @@
-/* Version ID for the JPEG library.
- * Might be useful for tests like "#if JPEG_LIB_VERSION >= 60".
- */
+#ifndef JPEG_LIB_VERSION
+#if defined(__arm__) || defined(__aarch64__)
+/* Debian / Raspberry Pi OS standard libjpeg is libjpeg.so.62 (API version 62) */
+#define JPEG_LIB_VERSION  62
+#else
+/* Ubuntu / x86_64 standard libjpeg is libjpeg.so.8 (API version 80) */
 #define JPEG_LIB_VERSION  80
+#endif
+#endif
 
 /* libjpeg-turbo version */
 #define LIBJPEG_TURBO_VERSION  2.1.5

@@ -16,7 +16,15 @@
 #include <signal.h>
 #include <inttypes.h>
 
+#if defined(__has_include)
+#if __has_include(<jpeglib.h>)
+#include <jpeglib.h>
+#else
 #include "jpeglib.h"
+#endif
+#else
+#include "jpeglib.h"
+#endif
 
 #define QUEUE_CAPACITY 1024
 #define PATH_MAX_LEN 2048
@@ -129,25 +137,33 @@ static bool is_jpeg_extension(const char *filename) {
 
 static int mkdir_p(const char *path) {
     char tmp[PATH_MAX_LEN];
-    char *p = NULL;
-    size_t len;
-
     snprintf(tmp, sizeof(tmp), "%s", path);
-    len = strlen(tmp);
+    size_t len = strlen(tmp);
     if (len == 0) return 0;
-    if (tmp[len - 1] == '/') tmp[len - 1] = 0;
+    while (len > 1 && tmp[len - 1] == '/') {
+        tmp[--len] = 0;
+    }
 
-    for (p = tmp + 1; *p; p++) {
+    struct stat st;
+    if (stat(tmp, &st) == 0 && S_ISDIR(st.st_mode)) {
+        return 0;
+    }
+
+    for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
             *p = 0;
-            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
-                return -1;
+            if (stat(tmp, &st) != 0) {
+                if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+                    return -1;
+                }
             }
             *p = '/';
         }
     }
-    if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
-        return -1;
+    if (stat(tmp, &st) != 0) {
+        if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+            return -1;
+        }
     }
     return 0;
 }
@@ -173,8 +189,10 @@ static int64_t get_file_size(const char *path) {
 
 // Scanline crop engine: partially decodes JPEG, saving RAM and CPU cycles
 static int process_single_jpeg(const char *in_path, const char *out_path,
-                               const Config *cfg, uint64_t *out_size) {
+                               const Config *cfg, uint64_t *out_size,
+                               char *err_buf, size_t err_buf_sz) {
     *out_size = 0;
+    if (err_buf && err_buf_sz > 0) err_buf[0] = 0;
 
     if (cfg->skip_existing) {
         int64_t sz = get_file_size(out_path);
@@ -185,16 +203,19 @@ static int process_single_jpeg(const char *in_path, const char *out_path,
 
     FILE *infile = fopen(in_path, "rb");
     if (!infile) {
+        if (err_buf) snprintf(err_buf, err_buf_sz, "Cannot open input: %s", strerror(errno));
         return -1;
     }
 
     struct jpeg_decompress_struct cinfo;
     struct my_error_mgr jerr;
+    memset(&jerr, 0, sizeof(jerr));
     cinfo.err = jpeg_std_error(&jerr.pub);
     jerr.pub.error_exit = my_error_exit;
     jerr.pub.output_message = my_output_message;
 
     if (setjmp(jerr.setjmp_buffer)) {
+        if (err_buf) snprintf(err_buf, err_buf_sz, "Decompress: %s", jerr.last_error[0] ? jerr.last_error : "libjpeg error");
         jpeg_destroy_decompress(&cinfo);
         fclose(infile);
         return -2;
@@ -249,7 +270,12 @@ static int process_single_jpeg(const char *in_path, const char *out_path,
     }
 
     // Ensure output parent directory exists
-    mkdir_parent(out_path);
+    if (mkdir_parent(out_path) != 0) {
+        if (err_buf) snprintf(err_buf, err_buf_sz, "Cannot create output parent dir: %s", strerror(errno));
+        jpeg_destroy_decompress(&cinfo);
+        fclose(infile);
+        return -3;
+    }
 
     // Write to a temporary file, then atomic rename
     char tmp_out_path[PATH_MAX_LEN + 32];
@@ -257,6 +283,7 @@ static int process_single_jpeg(const char *in_path, const char *out_path,
 
     FILE *outfile = fopen(tmp_out_path, "wb");
     if (!outfile) {
+        if (err_buf) snprintf(err_buf, err_buf_sz, "Cannot create output: %s", strerror(errno));
         jpeg_destroy_decompress(&cinfo);
         fclose(infile);
         return -3;
@@ -264,11 +291,13 @@ static int process_single_jpeg(const char *in_path, const char *out_path,
 
     struct jpeg_compress_struct cinfo_out;
     struct my_error_mgr jerr_out;
+    memset(&jerr_out, 0, sizeof(jerr_out));
     cinfo_out.err = jpeg_std_error(&jerr_out.pub);
     jerr_out.pub.error_exit = my_error_exit;
     jerr_out.pub.output_message = my_output_message;
 
     if (setjmp(jerr_out.setjmp_buffer)) {
+        if (err_buf) snprintf(err_buf, err_buf_sz, "Compress: %s", jerr_out.last_error[0] ? jerr_out.last_error : "libjpeg error");
         jpeg_destroy_compress(&cinfo_out);
         fclose(outfile);
         unlink(tmp_out_path);
@@ -323,6 +352,7 @@ static int process_single_jpeg(const char *in_path, const char *out_path,
 
     // Rename temp file to final output path
     if (rename(tmp_out_path, out_path) != 0) {
+        if (err_buf) snprintf(err_buf, err_buf_sz, "Rename failed: %s", strerror(errno));
         unlink(tmp_out_path);
         return -5;
     }
@@ -356,7 +386,8 @@ static void *worker_thread(void *arg) {
         pthread_mutex_unlock(&g_queue.lock);
 
         uint64_t out_size = 0;
-        int rc = process_single_jpeg(item.in_path, item.out_path, &g_config, &out_size);
+        char err_buf[512] = {0};
+        int rc = process_single_jpeg(item.in_path, item.out_path, &g_config, &out_size, err_buf, sizeof(err_buf));
 
         pthread_mutex_lock(&g_queue.lock);
         g_queue.active_workers--;
@@ -371,8 +402,9 @@ static void *worker_thread(void *arg) {
             g_stats.skipped++;
         } else {
             g_stats.failed++;
-            if (g_config.verbose) {
-                fprintf(stderr, "\n[Warning] Failed to crop %s (code %d)\n", item.in_path, rc);
+            if (g_stats.failed <= 5 || g_config.verbose) {
+                fprintf(stderr, "\n[Error #%" PRIu64 "] %s: %s (code %d)\n",
+                        g_stats.failed, item.in_path, err_buf[0] ? err_buf : "Failure", rc);
             }
         }
         pthread_mutex_unlock(&g_stats.lock);
@@ -636,7 +668,11 @@ int main(int argc, char **argv) {
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
-    mkdir_p(g_config.out_dir);
+    if (mkdir_p(g_config.out_dir) != 0) {
+        fprintf(stderr, "Error: Cannot create output directory '%s': %s\n",
+                g_config.out_dir, strerror(errno));
+        return 1;
+    }
 
     printf("=============================================================\n");
     printf(" Fast Picture Crop Tool (Raspberry Pi Zero 2 Optimized)\n");

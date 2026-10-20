@@ -1,6 +1,15 @@
 CC ?= gcc
 CFLAGS ?= -O3 -Wall -Wextra -pthread
-INCLUDES = -Iinclude
+# Check if system has native jpeglib.h installed (prefer system headers to match installed libjpeg)
+ifeq ($(wildcard /usr/include/jpeglib.h),)
+    INCLUDES = -Iinclude
+    LIBJPEG_VER62 := $(shell ldconfig -p 2>/dev/null | grep -E "libjpeg\.so\.62" | head -n 1)
+    ifneq ($(LIBJPEG_VER62),)
+        CFLAGS += -DJPEG_LIB_VERSION=62
+    endif
+else
+    INCLUDES =
+endif
 
 # Detect architecture for Raspberry Pi Zero 2 tuning
 UNAME_M := $(shell uname -m)
