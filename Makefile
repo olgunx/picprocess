@@ -38,30 +38,38 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
 TARGET = fastcrop
+DETECT_TARGET = fastdetect
 SRCS = src/fastcrop.c
+DETECT_SRCS = src/fastdetect.c
 
 .PHONY: all clean install uninstall test
 
-all: $(TARGET)
+all: $(TARGET) $(DETECT_TARGET)
 
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) $(INCLUDES) $(SRCS) $(LIBS) -o $(TARGET)
 	@echo "Build successful: $(TARGET)"
 
+$(DETECT_TARGET): $(DETECT_SRCS)
+	$(CC) $(CFLAGS) $(INCLUDES) $(DETECT_SRCS) $(LIBS) -o $(DETECT_TARGET)
+	@echo "Build successful: $(DETECT_TARGET)"
+
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(DETECT_TARGET)
 	rm -rf test_out /tmp/test_real /tmp/test_crops_*
 
-install: $(TARGET)
+install: $(TARGET) $(DETECT_TARGET)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
+	install -m 755 $(DETECT_TARGET) $(DESTDIR)$(BINDIR)/$(DETECT_TARGET)
 	install -m 755 fastcrop.py $(DESTDIR)$(BINDIR)/fastcrop-py
-	install -m 755 fastdetect.py $(DESTDIR)$(BINDIR)/fastdetect
+	install -m 755 fastdetect.py $(DESTDIR)$(BINDIR)/fastdetect-py
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
+	rm -f $(DESTDIR)$(BINDIR)/$(DETECT_TARGET)
 	rm -f $(DESTDIR)$(BINDIR)/fastcrop-py
-	rm -f $(DESTDIR)$(BINDIR)/fastdetect
+	rm -f $(DESTDIR)$(BINDIR)/fastdetect-py
 
 test: $(TARGET)
 	@python3 benchmark.py --quick

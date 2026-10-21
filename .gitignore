@@ -1,5 +1,6 @@
 # Compiled binaries
 fastcrop
+fastdetect
 *.o
 *.so
 *.a

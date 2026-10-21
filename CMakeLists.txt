@@ -39,6 +39,7 @@ else()
 endif()
 
 add_executable(fastcrop src/fastcrop.c)
+add_executable(fastdetect src/fastdetect.c)
 
 target_link_libraries(fastcrop PRIVATE
     ${JPEG_LIBRARIES}
@@ -46,5 +47,12 @@ target_link_libraries(fastcrop PRIVATE
     m
 )
 
-install(TARGETS fastcrop DESTINATION bin)
+target_link_libraries(fastdetect PRIVATE
+    ${JPEG_LIBRARIES}
+    Threads::Threads
+    m
+)
+
+install(TARGETS fastcrop fastdetect DESTINATION bin)
 install(PROGRAMS fastcrop.py DESTINATION bin RENAME fastcrop-py)
+install(PROGRAMS fastdetect.py DESTINATION bin RENAME fastdetect-py)
