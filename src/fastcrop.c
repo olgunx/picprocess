@@ -95,6 +95,11 @@ typedef struct {
     uint64_t failed;
     uint64_t bytes_in;
     uint64_t bytes_out;
+    double min_luma;
+    double max_luma;
+    double total_luma_sum;
+    uint64_t luma_count;
+    uint64_t luma_buckets[7];
 } Stats;
 
 static Config g_config = {
@@ -195,8 +200,10 @@ static int64_t get_file_size(const char *path) {
 // Scanline crop engine: partially decodes JPEG, saving RAM and CPU cycles
 static int process_single_jpeg(const char *in_path, const char *out_path,
                                const Config *cfg, uint64_t *out_size,
+                               double *measured_luma,
                                char *err_buf, size_t err_buf_sz) {
     *out_size = 0;
+    if (measured_luma) *measured_luma = -1.0;
     if (err_buf && err_buf_sz > 0) err_buf[0] = 0;
 
     if (cfg->skip_existing) {
@@ -329,6 +336,7 @@ static int process_single_jpeg(const char *in_path, const char *out_path,
 
         uint64_t num_pixels = (uint64_t)cw * (uint64_t)lines_read;
         double avg_luma = num_pixels > 0 ? (double)total_luma / (double)num_pixels : 0.0;
+        if (measured_luma) *measured_luma = avg_luma;
 
         if (avg_luma < (double)cfg->black_threshold) {
             // Filtered out as black! Discard without compression or disk write.
@@ -513,23 +521,44 @@ static void *worker_thread(void *arg) {
         pthread_mutex_unlock(&g_queue.lock);
 
         uint64_t out_size = 0;
+        double luma = -1.0;
         char err_buf[512] = {0};
-        int rc = process_single_jpeg(item.in_path, item.out_path, &g_config, &out_size, err_buf, sizeof(err_buf));
+        int rc = process_single_jpeg(item.in_path, item.out_path, &g_config, &out_size, &luma, err_buf, sizeof(err_buf));
 
         pthread_mutex_lock(&g_queue.lock);
         g_queue.active_workers--;
         pthread_mutex_unlock(&g_queue.lock);
 
         pthread_mutex_lock(&g_stats.lock);
+        if (luma >= 0.0) {
+            if (g_stats.luma_count == 0 || luma < g_stats.min_luma) g_stats.min_luma = luma;
+            if (g_stats.luma_count == 0 || luma > g_stats.max_luma) g_stats.max_luma = luma;
+            g_stats.total_luma_sum += luma;
+            g_stats.luma_count++;
+            if (luma < 10.0) g_stats.luma_buckets[0]++;
+            else if (luma < 20.0) g_stats.luma_buckets[1]++;
+            else if (luma < 30.0) g_stats.luma_buckets[2]++;
+            else if (luma < 40.0) g_stats.luma_buckets[3]++;
+            else if (luma < 60.0) g_stats.luma_buckets[4]++;
+            else if (luma < 100.0) g_stats.luma_buckets[5]++;
+            else g_stats.luma_buckets[6]++;
+        }
+
         if (rc == 0) {
             g_stats.processed++;
             g_stats.bytes_in += (item.in_size > 0 ? (uint64_t)item.in_size : 0);
             g_stats.bytes_out += out_size;
+            if (g_config.verbose && luma >= 0.0) {
+                fprintf(stderr, "\n[Kept] %s (mean luma: %.1f >= threshold %.1f)\n", item.in_path, luma, g_config.black_threshold);
+            }
         } else if (rc == 1) {
             g_stats.skipped++;
         } else if (rc == 2) {
             g_stats.black_filtered++;
             g_stats.bytes_in += (item.in_size > 0 ? (uint64_t)item.in_size : 0);
+            if (g_config.verbose) {
+                fprintf(stderr, "\n[Filtered] %s (mean luma: %.1f < threshold %.1f)\n", item.in_path, luma, g_config.black_threshold);
+            }
         } else {
             g_stats.failed++;
             if (g_stats.failed <= 5 || g_config.verbose) {
@@ -935,6 +964,34 @@ int main(int argc, char **argv) {
     printf(" Total Output Size:     %.2f MB\n", total_mb_out);
     printf(" Storage Space Saved:   %.1f%%\n", space_saved_pct);
     printf("=============================================================\n");
+
+    if (g_stats.luma_count > 0) {
+        double avg_luma = g_stats.total_luma_sum / (double)g_stats.luma_count;
+        printf("\n=============================================================\n");
+        printf(" Crop Luminance Analysis (Scale 0-255)\n");
+        printf("=============================================================\n");
+        printf(" Min: %.1f  |  Max: %.1f  |  Average: %.1f\n",
+               g_stats.min_luma, g_stats.max_luma, avg_luma);
+        printf(" Brightness Breakdown:\n");
+        printf("   < 10.0   (Pitch Black):       %6" PRIu64 " images%s\n",
+               g_stats.luma_buckets[0], (g_config.black_threshold >= 10.0f) ? "  [FILTERED]" : "");
+        printf("  10 - 20   (Dark Night Noise):  %6" PRIu64 " images%s\n",
+               g_stats.luma_buckets[1], (g_config.black_threshold >= 20.0f) ? "  [FILTERED]" : "");
+        printf("  20 - 30   (Dim / Twilight):    %6" PRIu64 " images%s\n",
+               g_stats.luma_buckets[2], (g_config.black_threshold >= 30.0f) ? "  [FILTERED]" : "");
+        printf("  30 - 40   (Low Light / Dusk):  %6" PRIu64 " images%s\n",
+               g_stats.luma_buckets[3], (g_config.black_threshold >= 40.0f) ? "  [FILTERED]" : "");
+        printf("  40 - 60   (Overcast / Dawn):   %6" PRIu64 " images%s\n",
+               g_stats.luma_buckets[4], (g_config.black_threshold >= 60.0f) ? "  [FILTERED]" : "");
+        printf("  60 - 100  (Normal Daylight):   %6" PRIu64 " images%s\n",
+               g_stats.luma_buckets[5], (g_config.black_threshold >= 100.0f) ? "  [FILTERED]" : "");
+        printf("  100+      (Bright Daylight):   %6" PRIu64 " images\n",
+               g_stats.luma_buckets[6]);
+        printf("-------------------------------------------------------------\n");
+        printf(" Tip: To increase sensitivity to dark, increase\n");
+        printf("      --black-threshold (e.g. --black-threshold 20.0 or 30.0).\n");
+        printf("=============================================================\n");
+    }
 
     return g_stats.failed > 0 ? 2 : 0;
 }

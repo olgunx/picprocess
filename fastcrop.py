@@ -82,6 +82,7 @@ def process_image(in_path, out_path, crop_spec, quality, out_format, skip_existi
             box = calculate_pixel_box(im.width, im.height, crop_spec)
             cropped = im.crop(box)
 
+            luma = None
             if filter_black:
                 # Fast mean luminance check on cropped region
                 stat = ImageStat.Stat(cropped)
@@ -91,7 +92,7 @@ def process_image(in_path, out_path, crop_spec, quality, out_format, skip_existi
                     luma = stat.mean[0]
 
                 if luma < black_threshold:
-                    return ('black_filtered', in_size, 0)
+                    return ('black_filtered', in_size, 0, luma)
 
             # Determine output format
             target_fmt = out_format
@@ -130,7 +131,7 @@ def process_image(in_path, out_path, crop_spec, quality, out_format, skip_existi
             cropped.save(out_path, format=target_fmt, **save_kwargs)
 
         out_size = os.path.getsize(out_path)
-        return ('success', in_size, out_size)
+        return ('success', in_size, out_size, luma)
     except Exception as exc:
         return ('error', 0, 0, str(exc))
 
@@ -267,6 +268,8 @@ Examples:
     # Bounded submission to keep memory strictly under control
     max_in_flight = args.threads * 64
 
+    luma_records = []
+
     with ThreadPoolExecutor(max_workers=args.threads) as executor:
         futures = set()
         task_gen = task_generator()
@@ -299,11 +302,15 @@ Examples:
                     processed += 1
                     bytes_in += res[1]
                     bytes_out += res[2]
+                    if len(res) > 3 and res[3] is not None:
+                        luma_records.append(res[3])
                 elif status == 'skipped':
                     skipped += 1
                 elif status == 'black_filtered':
                     black_filtered += 1
                     bytes_in += res[1]
+                    if len(res) > 3 and res[3] is not None:
+                        luma_records.append(res[3])
                 else:
                     failed += 1
                     if args.verbose and len(res) > 3:
@@ -343,6 +350,36 @@ Examples:
     print(f" Total Output Size:     {total_mb_out:.2f} MB")
     print(f" Storage Space Saved:   {space_saved:.1f}%")
     print("=============================================================")
+
+    if luma_records:
+        min_l = min(luma_records)
+        max_l = max(luma_records)
+        avg_l = sum(luma_records) / len(luma_records)
+        b0 = sum(1 for x in luma_records if x < 10.0)
+        b1 = sum(1 for x in luma_records if 10.0 <= x < 20.0)
+        b2 = sum(1 for x in luma_records if 20.0 <= x < 30.0)
+        b3 = sum(1 for x in luma_records if 30.0 <= x < 40.0)
+        b4 = sum(1 for x in luma_records if 40.0 <= x < 60.0)
+        b5 = sum(1 for x in luma_records if 60.0 <= x < 100.0)
+        b6 = sum(1 for x in luma_records if x >= 100.0)
+        t = args.black_threshold
+
+        print("\n=============================================================")
+        print(" Crop Luminance Analysis (Scale 0-255)")
+        print("=============================================================")
+        print(f" Min: {min_l:.1f}  |  Max: {max_l:.1f}  |  Average: {avg_l:.1f}")
+        print(" Brightness Breakdown:")
+        print(f"   < 10.0   (Pitch Black):       {b0:6d} images{'  [FILTERED]' if t >= 10.0 else ''}")
+        print(f"  10 - 20   (Dark Night Noise):  {b1:6d} images{'  [FILTERED]' if t >= 20.0 else ''}")
+        print(f"  20 - 30   (Dim / Twilight):    {b2:6d} images{'  [FILTERED]' if t >= 30.0 else ''}")
+        print(f"  30 - 40   (Low Light / Dusk):  {b3:6d} images{'  [FILTERED]' if t >= 40.0 else ''}")
+        print(f"  40 - 60   (Overcast / Dawn):   {b4:6d} images{'  [FILTERED]' if t >= 60.0 else ''}")
+        print(f"  60 - 100  (Normal Daylight):   {b5:6d} images{'  [FILTERED]' if t >= 100.0 else ''}")
+        print(f"  100+      (Bright Daylight):   {b6:6d} images")
+        print("-------------------------------------------------------------")
+        print(" Tip: To increase sensitivity to dark, increase")
+        print("      --black-threshold (e.g. --black-threshold 20.0 or 30.0).")
+        print("=============================================================")
 
 
 if __name__ == '__main__':
