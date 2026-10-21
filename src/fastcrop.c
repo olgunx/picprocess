@@ -949,12 +949,23 @@ int main(int argc, char **argv) {
     double total_mb_out = (double)g_stats.bytes_out / (1024.0 * 1024.0);
     double space_saved_pct = total_mb_in > 0 ? (1.0 - (total_mb_out / total_mb_in)) * 100.0 : 0.0;
 
+    uint64_t total_items = g_stats.processed + g_stats.skipped + g_stats.black_filtered + g_stats.failed;
+
     printf("\n\n=============================================================\n");
     printf(" Processing Summary\n");
     printf("=============================================================\n");
-    printf(" Successfully Cropped:  %" PRIu64 " images\n", g_stats.processed);
-    if (g_config.filter_black) {
-        printf(" Filtered (Black/Dark): %" PRIu64 " images\n", g_stats.black_filtered);
+    if (total_items > 0) {
+        printf(" Successfully Cropped:  %" PRIu64 " images (%.1f%%)\n",
+               g_stats.processed, (double)g_stats.processed / (double)total_items * 100.0);
+        if (g_config.filter_black) {
+            printf(" Filtered (Black/Dark): %" PRIu64 " images (%.1f%%)\n",
+                   g_stats.black_filtered, (double)g_stats.black_filtered / (double)total_items * 100.0);
+        }
+    } else {
+        printf(" Successfully Cropped:  %" PRIu64 " images\n", g_stats.processed);
+        if (g_config.filter_black) {
+            printf(" Filtered (Black/Dark): %" PRIu64 " images\n", g_stats.black_filtered);
+        }
     }
     printf(" Skipped (Pre-existing):%" PRIu64 " images\n", g_stats.skipped);
     printf(" Failed / Corrupt:      %" PRIu64 " images\n", g_stats.failed);

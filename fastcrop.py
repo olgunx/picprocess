@@ -336,12 +336,16 @@ Examples:
     total_mb_out = bytes_out / (1024 * 1024)
     space_saved = (1.0 - (total_mb_out / total_mb_in)) * 100.0 if total_mb_in > 0 else 0.0
 
+    total_items = processed + skipped + black_filtered + failed
+    proc_pct = (processed / total_items * 100.0) if total_items > 0 else 0.0
+    filt_pct = (black_filtered / total_items * 100.0) if total_items > 0 else 0.0
+
     print("\n\n=============================================================")
     print(" Processing Summary")
     print("=============================================================")
-    print(f" Successfully Cropped:  {processed} images")
+    print(f" Successfully Cropped:  {processed} images ({proc_pct:.1f}%)")
     if args.filter_black:
-        print(f" Filtered (Black/Dark): {black_filtered} images")
+        print(f" Filtered (Black/Dark): {black_filtered} images ({filt_pct:.1f}%)")
     print(f" Skipped (Pre-existing):{skipped} images")
     print(f" Failed / Corrupt:      {failed} images")
     print(f" Elapsed Time:          {t_total:.2f} seconds")
