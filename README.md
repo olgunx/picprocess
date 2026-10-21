@@ -156,6 +156,50 @@ python3 fastcrop.py -i ./large_batch -o ./compact_crops -c 200,200,600,600 --for
 
 ---
 
+## Transient Object / Anomaly Detector (`fastdetect.py`)
+
+`fastdetect.py` scans cropped surveillance or time-lapse image sequences to spot **humans, animals, vehicles, or stranger objects** appearing briefly across frames, optimized for **Raspberry Pi Zero / Zero 2 W** without requiring heavy ML frameworks.
+
+### How It Works
+1. **Sliding 5-Frame Ring Buffer (`O(1)` Memory):** Keeps only `2 * window + 1` frames in RAM at once (< 30 MB RSS regardless of whether you scan 50 or 100,000 images) and seamlessly bridges hour-folder boundaries.
+2. **Lighting & Gradient Normalization:** Normalizes per-channel exposure and subtracts a 25 px low-frequency background blur so morning/evening sunlight shifts do not trigger false alarms.
+3. **Temporal Minimum-Difference:** Each pixel is scored by its *minimum* difference against the surrounding `±2` frames (`t-2, t-1, t+1, t+2`). Slow shadow drift is ignored while objects appearing for 1–2 frames stand out sharply.
+4. **Local 16×16 Tile MAD Z-Score:** Scores each frame by its most anomalous `16x16` pixel tile rather than the whole-image mean, catching small targets (such as a `10x35` px person at long range).
+5. **Automatic Visual Reports:** Generates 3-panel zoomed comparison strips (`PREV | FLAGGED | NEXT`), individual zoomed crops, a combined `contact_sheet.png`, and `scores.csv`.
+
+### Setup & Usage on Raspberry Pi OS / Raspbian
+
+```bash
+# Install lightweight system packages (pre-compiled for ARMv6 / ARMv7 / ARM64)
+sudo apt update
+sudo apt install -y python3-numpy python3-pil
+
+# Scan a full day folder (recursively across all hour subdirectories):
+python3 fastdetect.py -i ./crop_1013 -o ./detections_1013
+
+# Scan a single hour folder or use a fixed score threshold:
+python3 fastdetect.py -i ./crop_1013/08 -o ./detections_08 --min-score 20.0
+```
+
+### `fastdetect.py` Options
+
+| Option | Shorthand | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `--input <path>` | `-i` | Input folder or root directory of cropped images | **Required** |
+| `--output <path>` | `-o` | Output folder for crops, comparison strips & CSV | **Required** |
+| `--recursive` / `--flat` | `-r` / `-n` | Scan subdirectories recursively in chronological order | `true` |
+| `--tile-size <px>` | | Tile size in pixels for local anomaly scoring | `16` |
+| `--window <1..3>` | | Temporal neighbor radius (`2` = 5-frame window) | `2` |
+| `--ignore-margins <L,T,R,B>` | | Edge margins in pixels to mask out moving foliage | `0,0,50,0` |
+| `--dark-threshold <0-255>` | | Skip night/dark frames below mean luminance | `40.0` |
+| `--glare-max-sat <pct>` | | Skip washed-out sun-glare frames (>N% pixels >250) | `15.0` |
+| `--min-score <val>` | | Fixed minimum score cutoff (overrides adaptive MAD) | *Adaptive* |
+| `--mad-multiplier <k>` | | Adaptive cutoff multiplier (`median + k * MAD`, min `12.0`) | `4.0` |
+| `--save-full` | | Also save full annotated frame with bounding box | `false` |
+| `--verbose` | `-v` | Print score and coordinates for every evaluated frame | `false` |
+
+---
+
 ## Running the Benchmark & Verification Suite
 
 You can verify speed and pixel accuracy on your machine or Pi at any time:

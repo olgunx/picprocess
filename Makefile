@@ -56,10 +56,12 @@ install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
 	install -m 755 fastcrop.py $(DESTDIR)$(BINDIR)/fastcrop-py
+	install -m 755 fastdetect.py $(DESTDIR)$(BINDIR)/fastdetect
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
 	rm -f $(DESTDIR)$(BINDIR)/fastcrop-py
+	rm -f $(DESTDIR)$(BINDIR)/fastdetect
 
 test: $(TARGET)
 	@python3 benchmark.py --quick
