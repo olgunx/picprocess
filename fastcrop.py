@@ -21,7 +21,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
-from PIL import Image, ImageFile
+from PIL import Image, ImageFile, ImageStat
 
 # Tolerate truncated images from slow camera writes/crashes
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -68,7 +68,8 @@ def calculate_pixel_box(im_width, im_height, crop_spec):
     return (x, y, x + w, y + h)
 
 
-def process_image(in_path, out_path, crop_spec, quality, out_format, skip_existing):
+def process_image(in_path, out_path, crop_spec, quality, out_format, skip_existing,
+                  filter_black=False, black_threshold=10.0):
     """Worker function to crop and save a single image with size optimizations."""
     try:
         if skip_existing and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -80,6 +81,17 @@ def process_image(in_path, out_path, crop_spec, quality, out_format, skip_existi
             # Calculate crop coordinates based on image dimensions
             box = calculate_pixel_box(im.width, im.height, crop_spec)
             cropped = im.crop(box)
+
+            if filter_black:
+                # Fast mean luminance check on cropped region
+                stat = ImageStat.Stat(cropped)
+                if len(stat.mean) >= 3:
+                    luma = 0.299 * stat.mean[0] + 0.587 * stat.mean[1] + 0.114 * stat.mean[2]
+                else:
+                    luma = stat.mean[0]
+
+                if luma < black_threshold:
+                    return ('black_filtered', in_size, 0)
 
             # Determine output format
             target_fmt = out_format
@@ -180,9 +192,17 @@ Examples:
     parser.add_argument('-n', '--no-recursive', '--flat', action='store_false', dest='recursive',
                         help="Disable subdirectories (top-level only)")
     parser.add_argument('-s', '--skip-existing', action='store_true', help="Skip files already present in output (resume)")
+    parser.add_argument('-B', '--filter-black', action='store_true',
+                        help="Filter out black/dark images (night without illumination)")
+    parser.add_argument('--black-threshold', type=float, default=10.0,
+                        help="Mean luminance threshold below which image is filtered (default: 10.0, scale 0-255)")
     parser.add_argument('-v', '--verbose', action='store_true', help="Print verbose error messages")
 
     args = parser.parse_args()
+
+    # If user explicitly passed a non-default threshold, auto-enable filter_black
+    if '--black-threshold' in sys.argv:
+        args.filter_black = True
 
     # Parse crop coordinates
     if args.crop:
@@ -212,6 +232,10 @@ Examples:
     print(f" Threads:      {args.threads} worker threads")
     print(f" Recursive:    {'Yes' if args.recursive else 'No'}")
     print(f" Skip Exists:  {'Yes' if args.skip_existing else 'No'}")
+    if args.filter_black:
+        print(f" Filter Black: Enabled (mean luminance < {args.black_threshold:.1f} / 255)")
+    else:
+        print(f" Filter Black: Disabled")
     print("=============================================================")
 
     # Stream tasks to ThreadPoolExecutor
@@ -220,6 +244,7 @@ Examples:
 
     processed = 0
     skipped = 0
+    black_filtered = 0
     failed = 0
     bytes_in = 0
     bytes_out = 0
@@ -253,7 +278,8 @@ Examples:
                 try:
                     src, dst = next(task_gen)
                     f = executor.submit(process_image, src, dst, crop_spec,
-                                        args.quality, out_format, args.skip_existing)
+                                        args.quality, out_format, args.skip_existing,
+                                        args.filter_black, args.black_threshold)
                     futures.add(f)
                 except StopIteration:
                     exhausted = True
@@ -275,6 +301,9 @@ Examples:
                     bytes_out += res[2]
                 elif status == 'skipped':
                     skipped += 1
+                elif status == 'black_filtered':
+                    black_filtered += 1
+                    bytes_in += res[1]
                 else:
                     failed += 1
                     if args.verbose and len(res) > 3:
@@ -283,19 +312,19 @@ Examples:
             now = time.time()
             if now - t_last_report >= 0.25:
                 elapsed = now - t_start
-                speed = (processed + skipped) / elapsed if elapsed > 0 else 0
+                speed = (processed + skipped + black_filtered) / elapsed if elapsed > 0 else 0
                 mb_in = bytes_in / (1024 * 1024)
                 mb_out = bytes_out / (1024 * 1024)
                 reduction = (1.0 - (mb_out / mb_in)) * 100.0 if mb_in > 0 else 0.0
                 sys.stdout.write(
-                    f"\r[Progress] Done: {processed + skipped} | {speed:.1f} img/s | "
-                    f"In: {mb_in:.1f} MB -> Out: {mb_out:.1f} MB (-{reduction:.1f}%) | Errs: {failed}   "
+                    f"\r[Progress] Done: {processed + skipped + black_filtered} | {speed:.1f} img/s | "
+                    f"In: {mb_in:.1f} MB -> Out: {mb_out:.1f} MB (-{reduction:.1f}%) | Filtered: {black_filtered} | Errs: {failed}   "
                 )
                 sys.stdout.flush()
                 t_last_report = now
 
     t_total = time.time() - t_start
-    avg_speed = (processed + skipped) / t_total if t_total > 0 else 0
+    avg_speed = (processed + skipped + black_filtered) / t_total if t_total > 0 else 0
     total_mb_in = bytes_in / (1024 * 1024)
     total_mb_out = bytes_out / (1024 * 1024)
     space_saved = (1.0 - (total_mb_out / total_mb_in)) * 100.0 if total_mb_in > 0 else 0.0
@@ -304,6 +333,8 @@ Examples:
     print(" Processing Summary")
     print("=============================================================")
     print(f" Successfully Cropped:  {processed} images")
+    if args.filter_black:
+        print(f" Filtered (Black/Dark): {black_filtered} images")
     print(f" Skipped (Pre-existing):{skipped} images")
     print(f" Failed / Corrupt:      {failed} images")
     print(f" Elapsed Time:          {t_total:.2f} seconds")

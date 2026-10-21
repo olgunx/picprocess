@@ -82,6 +82,8 @@ typedef struct {
     int num_threads;
     bool recursive;
     bool skip_existing;
+    bool filter_black;
+    float black_threshold;
     bool verbose;
 } Config;
 
@@ -89,6 +91,7 @@ typedef struct {
     pthread_mutex_t lock;
     uint64_t processed;
     uint64_t skipped;
+    uint64_t black_filtered;
     uint64_t failed;
     uint64_t bytes_in;
     uint64_t bytes_out;
@@ -110,6 +113,8 @@ static Config g_config = {
     .num_threads = 4,
     .recursive = true,
     .skip_existing = false,
+    .filter_black = false,
+    .black_threshold = 10.0f,
     .verbose = false
 };
 
@@ -214,10 +219,12 @@ static int process_single_jpeg(const char *in_path, const char *out_path,
     jerr.pub.error_exit = my_error_exit;
     jerr.pub.output_message = my_output_message;
 
+    unsigned char *crop_buf = NULL;
     if (setjmp(jerr.setjmp_buffer)) {
         if (err_buf) snprintf(err_buf, err_buf_sz, "Decompress: %s", jerr.last_error[0] ? jerr.last_error : "libjpeg error");
         jpeg_destroy_decompress(&cinfo);
         fclose(infile);
+        if (crop_buf) free(crop_buf);
         return -2;
     }
 
@@ -269,99 +276,219 @@ static int process_single_jpeg(const char *in_path, const char *out_path,
         jpeg_skip_scanlines(&cinfo, cy);
     }
 
-    // Ensure output parent directory exists
-    if (mkdir_parent(out_path) != 0) {
-        if (err_buf) snprintf(err_buf, err_buf_sz, "Cannot create output parent dir: %s", strerror(errno));
-        jpeg_destroy_decompress(&cinfo);
-        fclose(infile);
-        return -3;
-    }
-
-    // Write to a temporary file, then atomic rename
-    char tmp_out_path[PATH_MAX_LEN + 32];
-    snprintf(tmp_out_path, sizeof(tmp_out_path), "%s.tmp%lx", out_path, (unsigned long)pthread_self());
-
-    FILE *outfile = fopen(tmp_out_path, "wb");
-    if (!outfile) {
-        if (err_buf) snprintf(err_buf, err_buf_sz, "Cannot create output: %s", strerror(errno));
-        jpeg_destroy_decompress(&cinfo);
-        fclose(infile);
-        return -3;
-    }
-
-    struct jpeg_compress_struct cinfo_out;
-    struct my_error_mgr jerr_out;
-    memset(&jerr_out, 0, sizeof(jerr_out));
-    cinfo_out.err = jpeg_std_error(&jerr_out.pub);
-    jerr_out.pub.error_exit = my_error_exit;
-    jerr_out.pub.output_message = my_output_message;
-
-    if (setjmp(jerr_out.setjmp_buffer)) {
-        if (err_buf) snprintf(err_buf, err_buf_sz, "Compress: %s", jerr_out.last_error[0] ? jerr_out.last_error : "libjpeg error");
-        jpeg_destroy_compress(&cinfo_out);
-        fclose(outfile);
-        unlink(tmp_out_path);
-        jpeg_destroy_decompress(&cinfo);
-        fclose(infile);
-        return -4;
-    }
-
-    jpeg_create_compress(&cinfo_out);
-    jpeg_stdio_dest(&cinfo_out, outfile);
-
-    // Exact requested width and height
-    cinfo_out.image_width = cw;
-    cinfo_out.image_height = ch;
-    cinfo_out.input_components = cinfo.output_components;
-    cinfo_out.in_color_space = cinfo.out_color_space;
-
-    jpeg_set_defaults(&cinfo_out);
-    jpeg_set_quality(&cinfo_out, cfg->quality, TRUE);
-    cinfo_out.optimize_coding = TRUE; // Minimizes file size
-    cinfo_out.dct_method = JDCT_IFAST;
-
-    jpeg_start_compress(&cinfo_out, TRUE);
-
     // Allocate buffer for the MCU-aligned width
     JSAMPARRAY row_buffer = (*cinfo.mem->alloc_sarray)
         ((j_common_ptr)&cinfo, JPOOL_IMAGE, crop_w * cinfo.output_components, 1);
 
     int bytes_per_pixel = cinfo.output_components;
     int offset_bytes = x_offset_pixels * bytes_per_pixel;
+    size_t out_stride = (size_t)cw * bytes_per_pixel;
 
-    int lines_written = 0;
-    while (lines_written < ch && cinfo.output_scanline < cinfo.output_height) {
-        jpeg_read_scanlines(&cinfo, row_buffer, 1);
-        JSAMPROW out_row_ptr = row_buffer[0] + offset_bytes;
-        jpeg_write_scanlines(&cinfo_out, &out_row_ptr, 1);
-        lines_written++;
+    if (cfg->filter_black) {
+        // Buffering crop area allows calculating luminance and dropping black images
+        // BEFORE opening output file, initializing compressor, or writing to disk!
+        size_t crop_buf_size = out_stride * (size_t)ch;
+        crop_buf = (unsigned char *)malloc(crop_buf_size);
+        if (!crop_buf) {
+            if (err_buf) snprintf(err_buf, err_buf_sz, "Failed to allocate %zu bytes for crop buffer", crop_buf_size);
+            jpeg_destroy_decompress(&cinfo);
+            fclose(infile);
+            return -6;
+        }
+
+        uint64_t total_luma = 0;
+        volatile int lines_read = 0;
+        while (lines_read < ch && cinfo.output_scanline < cinfo.output_height) {
+            jpeg_read_scanlines(&cinfo, row_buffer, 1);
+            JSAMPROW out_row_ptr = row_buffer[0] + offset_bytes;
+            memcpy(crop_buf + (size_t)lines_read * out_stride, out_row_ptr, out_stride);
+
+            // Fast integer ITU-R BT.601 luminance: (R*77 + G*150 + B*29) >> 8
+            if (bytes_per_pixel >= 3) {
+                for (int i = 0; i < cw; i++) {
+                    uint8_t r = out_row_ptr[i * bytes_per_pixel];
+                    uint8_t g = out_row_ptr[i * bytes_per_pixel + 1];
+                    uint8_t b = out_row_ptr[i * bytes_per_pixel + 2];
+                    total_luma += (uint32_t)((r * 77 + g * 150 + b * 29) >> 8);
+                }
+            } else {
+                for (int i = 0; i < cw; i++) {
+                    total_luma += out_row_ptr[i];
+                }
+            }
+            lines_read++;
+        }
+
+        if (cinfo.output_scanline < cinfo.output_height) {
+            jpeg_skip_scanlines(&cinfo, cinfo.output_height - cinfo.output_scanline);
+        }
+        jpeg_finish_decompress(&cinfo);
+        jpeg_destroy_decompress(&cinfo);
+        fclose(infile);
+        infile = NULL;
+
+        uint64_t num_pixels = (uint64_t)cw * (uint64_t)lines_read;
+        double avg_luma = num_pixels > 0 ? (double)total_luma / (double)num_pixels : 0.0;
+
+        if (avg_luma < (double)cfg->black_threshold) {
+            // Filtered out as black! Discard without compression or disk write.
+            free(crop_buf);
+            return 2;
+        }
+
+        // Not black: initialize compressor and save
+        if (mkdir_parent(out_path) != 0) {
+            if (err_buf) snprintf(err_buf, err_buf_sz, "Cannot create output parent dir: %s", strerror(errno));
+            free(crop_buf);
+            return -3;
+        }
+
+        char tmp_out_path[PATH_MAX_LEN + 32];
+        snprintf(tmp_out_path, sizeof(tmp_out_path), "%s.tmp%lx", out_path, (unsigned long)pthread_self());
+
+        FILE *outfile = fopen(tmp_out_path, "wb");
+        if (!outfile) {
+            if (err_buf) snprintf(err_buf, err_buf_sz, "Cannot create output: %s", strerror(errno));
+            free(crop_buf);
+            return -3;
+        }
+
+        struct jpeg_compress_struct cinfo_out;
+        struct my_error_mgr jerr_out;
+        memset(&jerr_out, 0, sizeof(jerr_out));
+        cinfo_out.err = jpeg_std_error(&jerr_out.pub);
+        jerr_out.pub.error_exit = my_error_exit;
+        jerr_out.pub.output_message = my_output_message;
+
+        if (setjmp(jerr_out.setjmp_buffer)) {
+            if (err_buf) snprintf(err_buf, err_buf_sz, "Compress: %s", jerr_out.last_error[0] ? jerr_out.last_error : "libjpeg error");
+            jpeg_destroy_compress(&cinfo_out);
+            fclose(outfile);
+            unlink(tmp_out_path);
+            free(crop_buf);
+            return -4;
+        }
+
+        jpeg_create_compress(&cinfo_out);
+        jpeg_stdio_dest(&cinfo_out, outfile);
+
+        cinfo_out.image_width = cw;
+        cinfo_out.image_height = lines_read;
+        cinfo_out.input_components = bytes_per_pixel;
+        cinfo_out.in_color_space = (bytes_per_pixel >= 3) ? JCS_RGB : JCS_GRAYSCALE;
+
+        jpeg_set_defaults(&cinfo_out);
+        jpeg_set_quality(&cinfo_out, cfg->quality, TRUE);
+        cinfo_out.optimize_coding = TRUE;
+        cinfo_out.dct_method = JDCT_IFAST;
+
+        jpeg_start_compress(&cinfo_out, TRUE);
+
+        for (int i = 0; i < lines_read; i++) {
+            JSAMPROW row_ptr = crop_buf + (size_t)i * out_stride;
+            jpeg_write_scanlines(&cinfo_out, &row_ptr, 1);
+        }
+
+        jpeg_finish_compress(&cinfo_out);
+        jpeg_destroy_compress(&cinfo_out);
+        fclose(outfile);
+        free(crop_buf);
+
+        if (rename(tmp_out_path, out_path) != 0) {
+            if (err_buf) snprintf(err_buf, err_buf_sz, "Rename failed: %s", strerror(errno));
+            unlink(tmp_out_path);
+            return -5;
+        }
+
+        int64_t final_size = get_file_size(out_path);
+        if (final_size > 0) {
+            *out_size = (uint64_t)final_size;
+        }
+        return 0;
+    } else {
+        // Direct scanline streaming when black filtering is not active (minimal 1-scanline RAM)
+        if (mkdir_parent(out_path) != 0) {
+            if (err_buf) snprintf(err_buf, err_buf_sz, "Cannot create output parent dir: %s", strerror(errno));
+            jpeg_destroy_decompress(&cinfo);
+            fclose(infile);
+            return -3;
+        }
+
+        char tmp_out_path[PATH_MAX_LEN + 32];
+        snprintf(tmp_out_path, sizeof(tmp_out_path), "%s.tmp%lx", out_path, (unsigned long)pthread_self());
+
+        FILE *outfile = fopen(tmp_out_path, "wb");
+        if (!outfile) {
+            if (err_buf) snprintf(err_buf, err_buf_sz, "Cannot create output: %s", strerror(errno));
+            jpeg_destroy_decompress(&cinfo);
+            fclose(infile);
+            return -3;
+        }
+
+        struct jpeg_compress_struct cinfo_out;
+        struct my_error_mgr jerr_out;
+        memset(&jerr_out, 0, sizeof(jerr_out));
+        cinfo_out.err = jpeg_std_error(&jerr_out.pub);
+        jerr_out.pub.error_exit = my_error_exit;
+        jerr_out.pub.output_message = my_output_message;
+
+        if (setjmp(jerr_out.setjmp_buffer)) {
+            if (err_buf) snprintf(err_buf, err_buf_sz, "Compress: %s", jerr_out.last_error[0] ? jerr_out.last_error : "libjpeg error");
+            jpeg_destroy_compress(&cinfo_out);
+            fclose(outfile);
+            unlink(tmp_out_path);
+            jpeg_destroy_decompress(&cinfo);
+            fclose(infile);
+            return -4;
+        }
+
+        jpeg_create_compress(&cinfo_out);
+        jpeg_stdio_dest(&cinfo_out, outfile);
+
+        cinfo_out.image_width = cw;
+        cinfo_out.image_height = ch;
+        cinfo_out.input_components = cinfo.output_components;
+        cinfo_out.in_color_space = cinfo.out_color_space;
+
+        jpeg_set_defaults(&cinfo_out);
+        jpeg_set_quality(&cinfo_out, cfg->quality, TRUE);
+        cinfo_out.optimize_coding = TRUE;
+        cinfo_out.dct_method = JDCT_IFAST;
+
+        jpeg_start_compress(&cinfo_out, TRUE);
+
+        int lines_written = 0;
+        while (lines_written < ch && cinfo.output_scanline < cinfo.output_height) {
+            jpeg_read_scanlines(&cinfo, row_buffer, 1);
+            JSAMPROW out_row_ptr = row_buffer[0] + offset_bytes;
+            jpeg_write_scanlines(&cinfo_out, &out_row_ptr, 1);
+            lines_written++;
+        }
+
+        if (cinfo.output_scanline < cinfo.output_height) {
+            jpeg_skip_scanlines(&cinfo, cinfo.output_height - cinfo.output_scanline);
+        }
+
+        jpeg_finish_compress(&cinfo_out);
+        jpeg_destroy_compress(&cinfo_out);
+        fclose(outfile);
+
+        jpeg_finish_decompress(&cinfo);
+        jpeg_destroy_decompress(&cinfo);
+        fclose(infile);
+
+        if (rename(tmp_out_path, out_path) != 0) {
+            if (err_buf) snprintf(err_buf, err_buf_sz, "Rename failed: %s", strerror(errno));
+            unlink(tmp_out_path);
+            return -5;
+        }
+
+        int64_t final_size = get_file_size(out_path);
+        if (final_size > 0) {
+            *out_size = (uint64_t)final_size;
+        }
+        return 0;
     }
-
-    // Skip the remainder of the file
-    if (cinfo.output_scanline < cinfo.output_height) {
-        jpeg_skip_scanlines(&cinfo, cinfo.output_height - cinfo.output_scanline);
-    }
-
-    jpeg_finish_compress(&cinfo_out);
-    jpeg_destroy_compress(&cinfo_out);
-    fclose(outfile);
-
-    jpeg_finish_decompress(&cinfo);
-    jpeg_destroy_decompress(&cinfo);
-    fclose(infile);
-
-    // Rename temp file to final output path
-    if (rename(tmp_out_path, out_path) != 0) {
-        if (err_buf) snprintf(err_buf, err_buf_sz, "Rename failed: %s", strerror(errno));
-        unlink(tmp_out_path);
-        return -5;
-    }
-
-    int64_t final_size = get_file_size(out_path);
-    if (final_size > 0) {
-        *out_size = (uint64_t)final_size;
-    }
-    return 0; // Success
 }
 
 static void *worker_thread(void *arg) {
@@ -400,6 +527,9 @@ static void *worker_thread(void *arg) {
             g_stats.bytes_out += out_size;
         } else if (rc == 1) {
             g_stats.skipped++;
+        } else if (rc == 2) {
+            g_stats.black_filtered++;
+            g_stats.bytes_in += (item.in_size > 0 ? (uint64_t)item.in_size : 0);
         } else {
             g_stats.failed++;
             if (g_stats.failed <= 5 || g_config.verbose) {
@@ -521,13 +651,15 @@ static void print_help(const char *progname) {
     printf("  -r, --recursive               Process subdirectories (default: ENABLED)\n");
     printf("  -n, --no-recursive, --flat    Disable subdirectories processing (top-level only)\n");
     printf("  -s, --skip-existing           Skip files already present in output (resume)\n");
+    printf("  -B, --filter-black            Filter out black/dark images (night without illumination)\n");
+    printf("      --black-threshold <val>   Mean luminance threshold 0-255 (default: 10.0)\n");
     printf("  -v, --verbose                 Enable detailed warning messages\n");
     printf("  -h, --help                    Show this help message\n\n");
     printf("Examples:\n");
     printf("  # Crop a 640x480 box across all folders and subfolders:\n");
     printf("  %s -i /media/photos -o /media/crops -c 100,50,640,480\n\n", progname);
-    printf("  # Crop the center 50%% with quality 75 and 4 threads:\n");
-    printf("  %s -i ./photos -o ./crops -p 25,25,50,50 -q 75 -t 4 -s\n\n", progname);
+    printf("  # Crop the center 50%% with quality 75 and 4 threads, filtering black frames:\n");
+    printf("  %s -i ./photos -o ./crops -p 25,25,50,50 -q 75 -t 4 -s -B\n\n", progname);
 }
 
 int main(int argc, char **argv) {
@@ -537,26 +669,28 @@ int main(int argc, char **argv) {
     g_config.num_threads = default_threads;
 
     static struct option long_options[] = {
-        {"input",         required_argument, 0, 'i'},
-        {"output",        required_argument, 0, 'o'},
-        {"crop",          required_argument, 0, 'c'},
-        {"crop-pct",      required_argument, 0, 'p'},
-        {"bbox",          required_argument, 0, 'b'},
-        {"quality",       required_argument, 0, 'q'},
-        {"threads",       required_argument, 0, 't'},
-        {"recursive",     no_argument,       0, 'r'},
-        {"no-recursive",  no_argument,       0, 'n'},
-        {"flat",          no_argument,       0, 'n'},
-        {"skip-existing", no_argument,       0, 's'},
-        {"verbose",       no_argument,       0, 'v'},
-        {"help",          no_argument,       0, 'h'},
+        {"input",           required_argument, 0, 'i'},
+        {"output",          required_argument, 0, 'o'},
+        {"crop",            required_argument, 0, 'c'},
+        {"crop-pct",        required_argument, 0, 'p'},
+        {"bbox",            required_argument, 0, 'b'},
+        {"quality",         required_argument, 0, 'q'},
+        {"threads",         required_argument, 0, 't'},
+        {"recursive",       no_argument,       0, 'r'},
+        {"no-recursive",    no_argument,       0, 'n'},
+        {"flat",            no_argument,       0, 'n'},
+        {"skip-existing",   no_argument,       0, 's'},
+        {"filter-black",    no_argument,       0, 'B'},
+        {"black-threshold", required_argument, 0, 1001},
+        {"verbose",         no_argument,       0, 'v'},
+        {"help",            no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
     bool has_crop = false;
 
-    while ((opt = getopt_long(argc, argv, "i:o:c:p:b:q:t:rnsvh", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:o:c:p:b:q:t:rnsvhB", long_options, NULL)) != -1) {
         switch (opt) {
             case 'i':
                 snprintf(g_config.in_dir, sizeof(g_config.in_dir), "%s", optarg);
@@ -619,6 +753,13 @@ int main(int argc, char **argv) {
                 break;
             case 's':
                 g_config.skip_existing = true;
+                break;
+            case 'B':
+                g_config.filter_black = true;
+                break;
+            case 1001:
+                g_config.black_threshold = (float)atof(optarg);
+                g_config.filter_black = true;
                 break;
             case 'v':
                 g_config.verbose = true;
@@ -690,6 +831,11 @@ int main(int argc, char **argv) {
     printf(" Threads:      %d worker threads\n", g_config.num_threads);
     printf(" Recursive:    %s\n", g_config.recursive ? "Yes" : "No");
     printf(" Skip Exists:  %s\n", g_config.skip_existing ? "Yes" : "No");
+    if (g_config.filter_black) {
+        printf(" Filter Black: Enabled (mean luminance < %.1f / 255)\n", g_config.black_threshold);
+    } else {
+        printf(" Filter Black: Disabled\n");
+    }
     printf("=============================================================\n");
 
     // Spawn worker threads
@@ -732,24 +878,25 @@ int main(int argc, char **argv) {
             pthread_mutex_lock(&g_stats.lock);
             uint64_t proc = g_stats.processed;
             uint64_t skip = g_stats.skipped;
+            uint64_t blk  = g_stats.black_filtered;
             uint64_t fail = g_stats.failed;
             uint64_t bin = g_stats.bytes_in;
             uint64_t bout = g_stats.bytes_out;
             pthread_mutex_unlock(&g_stats.lock);
 
             double elapsed = now - t_start;
-            double speed = elapsed > 0 ? (double)(proc + skip) / elapsed : 0;
+            double speed = elapsed > 0 ? (double)(proc + skip + blk) / elapsed : 0;
             double mb_in = (double)bin / (1024.0 * 1024.0);
             double mb_out = (double)bout / (1024.0 * 1024.0);
             double reduction = mb_in > 0 ? (1.0 - (mb_out / mb_in)) * 100.0 : 0;
 
             if (enqueued > 0) {
-                double pct = (double)(proc + skip + fail) / (double)enqueued * 100.0;
-                printf("\r[Progress] %" PRIu64 "/%" PRIu64 " (%.1f%%) | %.1f img/s | In: %.1f MB -> Out: %.1f MB (-%.1f%%) | Errs: %" PRIu64 "   ",
-                       proc + skip, enqueued, pct, speed, mb_in, mb_out, reduction, fail);
+                double pct = (double)(proc + skip + blk + fail) / (double)enqueued * 100.0;
+                printf("\r[Progress] %" PRIu64 "/%" PRIu64 " (%.1f%%) | %.1f img/s | In: %.1f MB -> Out: %.1f MB (-%.1f%%) | Filtered: %" PRIu64 " | Errs: %" PRIu64 "   ",
+                       proc + skip + blk, enqueued, pct, speed, mb_in, mb_out, reduction, blk, fail);
             } else {
-                printf("\r[Progress] Done: %" PRIu64 " | %.1f img/s | In: %.1f MB -> Out: %.1f MB (-%.1f%%) | Errs: %" PRIu64 "   ",
-                       proc + skip, speed, mb_in, mb_out, reduction, fail);
+                printf("\r[Progress] Done: %" PRIu64 " | %.1f img/s | In: %.1f MB -> Out: %.1f MB (-%.1f%%) | Filtered: %" PRIu64 " | Errs: %" PRIu64 "   ",
+                       proc + skip + blk, speed, mb_in, mb_out, reduction, blk, fail);
             }
             fflush(stdout);
             t_last_report = now;
@@ -768,7 +915,7 @@ int main(int argc, char **argv) {
     free(threads);
 
     double t_total = get_time_sec() - t_start;
-    double avg_speed = t_total > 0 ? (double)(g_stats.processed + g_stats.skipped) / t_total : 0;
+    double avg_speed = t_total > 0 ? (double)(g_stats.processed + g_stats.skipped + g_stats.black_filtered) / t_total : 0;
     double total_mb_in = (double)g_stats.bytes_in / (1024.0 * 1024.0);
     double total_mb_out = (double)g_stats.bytes_out / (1024.0 * 1024.0);
     double space_saved_pct = total_mb_in > 0 ? (1.0 - (total_mb_out / total_mb_in)) * 100.0 : 0.0;
@@ -777,6 +924,9 @@ int main(int argc, char **argv) {
     printf(" Processing Summary\n");
     printf("=============================================================\n");
     printf(" Successfully Cropped:  %" PRIu64 " images\n", g_stats.processed);
+    if (g_config.filter_black) {
+        printf(" Filtered (Black/Dark): %" PRIu64 " images\n", g_stats.black_filtered);
+    }
     printf(" Skipped (Pre-existing):%" PRIu64 " images\n", g_stats.skipped);
     printf(" Failed / Corrupt:      %" PRIu64 " images\n", g_stats.failed);
     printf(" Elapsed Time:          %.2f seconds\n", t_total);
