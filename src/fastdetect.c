@@ -75,6 +75,8 @@ typedef struct {
     int x;
     int y;
     float luma;
+    float peak_tile;
+    float peak_to_mean;
     char crop_file[PATH_MAX_LEN];
     char compare_file[PATH_MAX_LEN];
     char tag[128];
@@ -95,6 +97,8 @@ typedef struct {
     float min_score;
     bool use_fixed_score;
     float mad_multiplier;
+    float min_peak_ratio;
+    float min_tile_diff;
     bool save_full;
     bool verbose;
     int quality;
@@ -570,7 +574,9 @@ static float score_frame_c(
     int num_neighbors,
     const DetectConfig *cfg,
     int *out_x,
-    int *out_y
+    int *out_y,
+    float *out_peak_tile,
+    float *out_peak_to_mean
 ) {
     int W = center->width;
     int H = center->height;
@@ -658,6 +664,17 @@ static float score_frame_c(
             }
         }
     }
+    float max_tile = 0.0f;
+    float sum_tiles = 0.0f;
+    for (size_t i = 0; i < ntiles; i++) {
+        sum_tiles += tiles[i];
+        if (tiles[i] > max_tile) max_tile = tiles[i];
+    }
+    float mean_tile = ntiles > 0 ? (sum_tiles / (float)ntiles) : 0.0f;
+    float peak_to_mean = mean_tile > 1e-6f ? (max_tile / mean_tile) : 0.0f;
+
+    if (out_peak_tile) *out_peak_tile = max_tile;
+    if (out_peak_to_mean) *out_peak_to_mean = peak_to_mean;
 
     free(tiles);
     free(sorted);
@@ -965,7 +982,8 @@ static void evaluate_center_slot(
     if (n_nb == 0) return;
 
     int bx = 0, by = 0;
-    float score = score_frame_c(center, neighbors, n_nb, cfg, &bx, &by);
+    float peak_tile = 0.0f, peak_to_mean = 0.0f;
+    float score = score_frame_c(center, neighbors, n_nb, cfg, &bx, &by, &peak_tile, &peak_to_mean);
 
     if (*rec_count == *rec_cap) {
         size_t new_cap = *rec_cap == 0 ? 512 : (*rec_cap * 2);
@@ -992,11 +1010,13 @@ static void evaluate_center_slot(
     rec->x = bx;
     rec->y = by;
     rec->luma = center->luma;
+    rec->peak_tile = peak_tile;
+    rec->peak_to_mean = peak_to_mean;
     (*rec_count)++;
 
     if (cfg->verbose) {
-        printf("  [Eval] %s  score=%7.1f  at=(%d,%d)  luma=%.1f\n",
-               center->name, score, bx, by, center->luma);
+        printf("  [Eval] %s  score=%7.1f  peak=%5.1f  p/m=%4.1f  at=(%d,%d)  luma=%.1f\n",
+               center->name, score, peak_tile, peak_to_mean, bx, by, center->luma);
     }
 }
 
@@ -1016,6 +1036,8 @@ static void print_usage(const char *prog) {
     printf("      --glare-max-sat <pct>    Skip sun-glare frames with >pct%% pixels >250 (default: 15.0)\n");
     printf("      --min-score <val>        Fixed anomaly score cutoff (overrides adaptive MAD)\n");
     printf("      --mad-multiplier <k>     Adaptive cutoff: median + k * MAD (default: 4.0)\n");
+    printf("      --min-peak-ratio <val>   Min peak/mean spatial ratio to filter lighting changes (default: 6.0)\n");
+    printf("      --min-tile-diff <val>    Min peak tile diff to filter diffuse changes (default: 25.0)\n");
     printf("  -q, --quality <1-100>        JPEG output quality for crops/sheets (default: 85)\n");
     printf("      --save-full              Also save full annotated frame for flagged detections\n");
     printf("  -v, --verbose                Print score and coordinates for every evaluated frame\n");
@@ -1038,6 +1060,8 @@ int main(int argc, char **argv) {
         .min_score = 0.0f,
         .use_fixed_score = false,
         .mad_multiplier = 4.0f,
+        .min_peak_ratio = 6.0f,
+        .min_tile_diff = 25.0f,
         .save_full = false,
         .verbose = false,
         .quality = 85
@@ -1056,6 +1080,8 @@ int main(int argc, char **argv) {
         {"glare-max-sat", required_argument, 0, 1005},
         {"min-score", required_argument, 0, 1006},
         {"mad-multiplier", required_argument, 0, 1007},
+        {"min-peak-ratio", required_argument, 0, 1009},
+        {"min-tile-diff", required_argument, 0, 1010},
         {"save-full", no_argument, 0, 1008},
         {"quality", required_argument, 0, 'q'},
         {"verbose", no_argument, 0, 'v'},
@@ -1113,6 +1139,12 @@ int main(int argc, char **argv) {
                 break;
             case 1008:
                 cfg.save_full = true;
+                break;
+            case 1009:
+                cfg.min_peak_ratio = strtof(optarg, NULL);
+                break;
+            case 1010:
+                cfg.min_tile_diff = strtof(optarg, NULL);
                 break;
             case 'v':
                 cfg.verbose = true;
@@ -1299,22 +1331,28 @@ int main(int argc, char **argv) {
     snprintf(csv_path, sizeof(csv_path), "%.1900s/scores.csv", cfg.out_dir);
     FILE *f_csv = fopen(csv_path, "w");
     if (f_csv) {
-        fprintf(f_csv, "filename,path,score,x,y,luma,flagged\n");
+        fprintf(f_csv, "filename,path,score,x,y,luma,peak_tile,peak_to_mean,flagged\n");
         for (size_t i = 0; i < rec_count; i++) {
             bool is_flag = records[i].score > threshold;
-            fprintf(f_csv, "%s,\"%s\",%.2f,%d,%d,%.1f,%s\n",
+            if (cfg.min_tile_diff > 0.0f && records[i].peak_tile < cfg.min_tile_diff) is_flag = false;
+            if (cfg.min_peak_ratio > 0.0f && records[i].peak_to_mean < cfg.min_peak_ratio) is_flag = false;
+            fprintf(f_csv, "%s,\"%s\",%.2f,%d,%d,%.1f,%.1f,%.2f,%s\n",
                     records[i].name, records[i].path, records[i].score,
                     records[i].x, records[i].y, records[i].luma,
+                    records[i].peak_tile, records[i].peak_to_mean,
                     is_flag ? "YES" : "NO");
         }
         fclose(f_csv);
     }
 
-    // Collect and sort flagged frames descending by score
+    // Collect and sort flagged frames descending by score (filtering diffuse light changes)
     EvalRecord *flagged = malloc(rec_count * sizeof(EvalRecord));
     size_t n_flagged = 0;
     for (size_t i = 0; i < rec_count; i++) {
-        if (records[i].score > threshold) {
+        bool is_flag = records[i].score > threshold;
+        if (cfg.min_tile_diff > 0.0f && records[i].peak_tile < cfg.min_tile_diff) is_flag = false;
+        if (cfg.min_peak_ratio > 0.0f && records[i].peak_to_mean < cfg.min_peak_ratio) is_flag = false;
+        if (is_flag) {
             flagged[n_flagged++] = records[i];
         }
     }

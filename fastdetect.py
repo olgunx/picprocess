@@ -165,7 +165,12 @@ def score_frame(center_entry, neighbor_entries, tile_size=16, margins=(0, 0, 50,
 
     best_x = x0 + tx * tile_size
     best_y = y0 + ty * tile_size
-    return max_z, best_x, best_y
+
+    peak_tile = float(tiles.max())
+    mean_tile = float(tiles.mean())
+    peak_to_mean = float(peak_tile / (mean_tile + 1e-6))
+
+    return max_z, best_x, best_y, peak_tile, peak_to_mean
 
 
 def save_detection_visuals(
@@ -346,6 +351,14 @@ Examples:
         help='Multiplier k for adaptive threshold: median + k * MAD (default: 4.0)'
     )
     parser.add_argument(
+        '--min-peak-ratio', type=float, default=6.0,
+        help='Minimum ratio of peak tile difference to average tile difference across frame to filter diffuse light changes (default: 6.0, 0 to disable)'
+    )
+    parser.add_argument(
+        '--min-tile-diff', type=float, default=25.0,
+        help='Minimum absolute tile difference to filter low-contrast twilight/sensor noise (default: 25.0, 0 to disable)'
+    )
+    parser.add_argument(
         '--save-full', action='store_true',
         help='Also save full-frame JPEG with bounding box for each flagged image'
     )
@@ -401,7 +414,7 @@ Examples:
         neighbors = [buf_list[j] for j in range(len(buf_list)) if j != center_idx]
         if not neighbors:
             return
-        score, bx, by = score_frame(
+        score, bx, by, peak_tile, peak_to_mean = score_frame(
             center, neighbors, tile_size=args.tile_size, margins=margins
         )
         prev_p = buf_list[center_idx - 1]['path'] if center_idx > 0 else None
@@ -414,10 +427,12 @@ Examples:
             'x': bx,
             'y': by,
             'luma': center['luma'],
+            'peak_tile': peak_tile,
+            'peak_to_mean': peak_to_mean,
         }
         evaluated_results.append(rec)
         if args.verbose:
-            print(f"  [Eval] {center['path'].name}  score={score:7.1f}  at=({bx},{by})  luma={center['luma']:.1f}")
+            print(f"  [Eval] {center['path'].name}  score={score:7.1f}  peak={peak_tile:5.1f}  p/m={peak_to_mean:4.1f}  at=({bx},{by})  luma={center['luma']:.1f}")
 
     valid_loaded = 0
 
@@ -484,17 +499,26 @@ Examples:
     adaptive_thr = max(12.0, med_s + args.mad_multiplier * mad_s)
     threshold = args.min_score if args.min_score is not None else adaptive_thr
 
-    # Sort flagged results by score descending
-    flagged = [r for r in evaluated_results if r['score'] > threshold]
+    # Sort flagged results by score descending, filtering out diffuse light-level shifts
+    flagged = [
+        r for r in evaluated_results
+        if r['score'] > threshold
+        and r.get('peak_tile', 999.0) >= args.min_tile_diff
+        and r.get('peak_to_mean', 999.0) >= args.min_peak_ratio
+    ]
     flagged.sort(key=lambda r: r['score'], reverse=True)
 
     # Save CSV of all evaluated frames
     csv_path = out_dir / "scores.csv"
     with open(csv_path, 'w', newline='', encoding='utf-8') as f_csv:
         writer = csv.writer(f_csv)
-        writer.writerow(['filename', 'path', 'score', 'x', 'y', 'luma', 'flagged'])
+        writer.writerow(['filename', 'path', 'score', 'x', 'y', 'luma', 'peak_tile', 'peak_to_mean', 'flagged'])
         for r in evaluated_results:
-            is_flag = r['score'] > threshold
+            is_flag = (
+                r['score'] > threshold
+                and r.get('peak_tile', 999.0) >= args.min_tile_diff
+                and r.get('peak_to_mean', 999.0) >= args.min_peak_ratio
+            )
             writer.writerow([
                 r['path'].name,
                 str(r['path']),
@@ -502,6 +526,8 @@ Examples:
                 r['x'],
                 r['y'],
                 f"{r['luma']:.1f}",
+                f"{r.get('peak_tile', 0.0):.1f}",
+                f"{r.get('peak_to_mean', 0.0):.2f}",
                 'YES' if is_flag else 'NO',
             ])
 
